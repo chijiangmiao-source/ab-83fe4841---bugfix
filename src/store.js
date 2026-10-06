@@ -17,6 +17,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
+const rotation = require('./rotation');
+
 const STATE_VERSION = 1;
 
 function initialState() {
@@ -39,7 +41,20 @@ class Store {
       if (!parsed || parsed.version !== STATE_VERSION || typeof parsed.domains !== 'object' || parsed.domains === null) {
         throw new Error(`状态文件损坏或版本不受支持：${this.file}`);
       }
-      this.state = parsed;
+      // 打开已持久化的设备域时，安全恢复被旧版本跨代改写过的历史证据；
+      // 链头、待签候选与竞争候选的结论均不受影响。修复结果立即原子落盘。
+      let repaired = false;
+      const domains = {};
+      for (const [domainId, domain] of Object.entries(parsed.domains)) {
+        const outcome = rotation.recoverDomainHistory(domain);
+        domains[domainId] = outcome.domain;
+        repaired = repaired || outcome.repaired;
+      }
+      this.state = repaired ? { ...parsed, domains } : parsed;
+      if (repaired) {
+        this._persist(this.state);
+        console.log('[store] 已从磁盘恢复设备域历史签名证据（不可变历史已修复并重新落盘）');
+      }
     } else {
       this.state = initialState();
       this._persist(this.state);

@@ -341,27 +341,22 @@ function submitSignatures(state, domainId, rotationId, signatures, now) {
 
   const mergedSignatures = rotation.signatures.concat(accepted);
   let nextRotation = { ...rotation, signatures: mergedSignatures };
-  const signerEvidence = { ...(domain.signerEvidence || {}) };
-  for (const evidence of accepted) {
-    signerEvidence[evidence.publicKey] = evidence;
-  }
-  const checkpoints = {};
-  for (const [digest, checkpoint] of Object.entries(domain.checkpoints)) {
-    checkpoints[digest] = {
-      ...checkpoint,
-      evidence: checkpoint.evidence.map((evidence) => signerEvidence[evidence.publicKey] || evidence),
-    };
-  }
+  // 后续候选收集签名只能改变候选自身；已激活检查点的证据是不可变历史，
+  // 绝不能因为同一公钥在后续代次再次签名而被回写。
   let nextDomain = {
     ...domain,
-    signerEvidence,
-    checkpoints,
     rotations: { ...domain.rotations, [rotationId]: nextRotation },
   };
   let activated = false;
 
   if (mergedSignatures.length >= parentCheckpoint.threshold) {
     activated = true;
+    // 激活时固化证据快照（独立副本）：此后历史中的签名内容与接收时间不再改变。
+    const evidence = mergedSignatures.map((s) => ({
+      publicKey: s.publicKey,
+      signature: s.signature,
+      receivedAt: s.receivedAt,
+    }));
     const checkpoint = {
       digest: rotation.digest,
       domainId,
@@ -372,7 +367,7 @@ function submitSignatures(state, domainId, rotationId, signatures, now) {
       keys: rotation.keys,
       status: 'activated',
       activatedAt: now,
-      evidence: mergedSignatures,
+      evidence,
     };
     nextRotation = { ...nextRotation, status: 'activated', activatedAt: now };
     const nextRotations = { ...nextDomain.rotations, [rotationId]: nextRotation };
@@ -411,6 +406,70 @@ function submitSignatures(state, domainId, rotationId, signatures, now) {
   };
 }
 
+/**
+ * 打开持久化状态时修复历史证据。
+ *
+ * 逐个校验已激活检查点中的每份证据是否针对“该检查点自身”的规范授权
+ * 消息（父摘要、密钥集、代次均固定在该代）。旧版本曾按公钥跨代回写
+ * 证据，使同一公钥在后续候选上的新签名污染历史；此处从对应轮换记录
+ * 保留的原始签名恢复签名内容与接收时间。
+ *
+ * 链头、候选状态（待签/已激活/已取代）、拒因与候选自身的去重签名均
+ * 不参与、也不会被修复改动。无法验证且无可靠来源的证据直接报错，
+ * 绝不用不可验证的内容冒充历史。
+ *
+ * @returns {{domain: object, repaired: boolean}}
+ */
+function recoverDomainHistory(domain) {
+  const rotations = domain.rotations || {};
+  const sourceCheckpoints = domain.checkpoints || {};
+  const checkpoints = {};
+  let checkpointsChanged = false;
+
+  for (const [digest, cp] of Object.entries(sourceCheckpoints)) {
+    if (cp.rotationId === GENESIS_ROTATION_ID || !Array.isArray(cp.evidence) || cp.evidence.length === 0) {
+      checkpoints[digest] = cp;
+      continue;
+    }
+    const message = authorizationMessage(cp);
+    let checkpointChanged = false;
+    const evidence = cp.evidence.map((entry) => {
+      if (entry && verifyAuthorization(message, entry.signature, entry.publicKey)) {
+        return entry;
+      }
+      checkpointChanged = true;
+      const record = rotations[cp.rotationId];
+      const original =
+        record && Array.isArray(record.signatures)
+          ? record.signatures.find((s) => s.publicKey === entry?.publicKey)
+          : null;
+      if (!original || !verifyAuthorization(message, original.signature, original.publicKey)) {
+        throw new DomainError(
+          'history_corrupt',
+          `检查点 ${digest}（轮换 ${cp.rotationId}）中签名者 ${entry?.publicKey || '未知'} 的历史证据无法验证且无可恢复来源`,
+        );
+      }
+      return { publicKey: original.publicKey, signature: original.signature, receivedAt: original.receivedAt };
+    });
+    checkpointsChanged = checkpointsChanged || checkpointChanged;
+    checkpoints[digest] = checkpointChanged ? { ...cp, evidence } : cp;
+  }
+
+  let nextDomain = domain;
+  let repaired = false;
+  if (checkpointsChanged) {
+    nextDomain = { ...nextDomain, checkpoints };
+    repaired = true;
+  }
+  // 旧版本遗留的按公钥索引表本身就是跨代污染来源，恢复时移除。
+  if (Object.prototype.hasOwnProperty.call(nextDomain, 'signerEvidence')) {
+    nextDomain = { ...nextDomain };
+    delete nextDomain.signerEvidence;
+    repaired = true;
+  }
+  return { domain: nextDomain, repaired };
+}
+
 /** 当前活动链头视图（含签名证据）。 */
 function headView(domain) {
   const head = domain.checkpoints[domain.headDigest];
@@ -445,5 +504,6 @@ module.exports = {
   createDomain,
   createRotation,
   submitSignatures,
+  recoverDomainHistory,
   headView,
 };
