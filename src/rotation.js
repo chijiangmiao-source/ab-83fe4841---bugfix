@@ -10,6 +10,10 @@
  *  - 父检查点密钥成员对“规范 UTF-8 授权消息”做 Ed25519 签名；
  *    去重后的签名者达到父门限时，候选在同一次持久化提交中激活，
  *    同一父摘要下的其余待签候选在同一提交中被取代（已拒）。
+ *  - 已激活检查点的签名证据是不可变历史：后续候选收集签名只追加到
+ *    自身待签证据；即使同一公钥跨代参与授权，历史中的签名内容与
+ *    接收时间也不得改变。加载持久化状态时会逐检查点校验证据，
+ *    被改写的条目从候选签名记录中恢复为可验证的原始签名。
  */
 
 const crypto = require('node:crypto');
@@ -341,21 +345,10 @@ function submitSignatures(state, domainId, rotationId, signatures, now) {
 
   const mergedSignatures = rotation.signatures.concat(accepted);
   let nextRotation = { ...rotation, signatures: mergedSignatures };
-  const signerEvidence = { ...(domain.signerEvidence || {}) };
-  for (const evidence of accepted) {
-    signerEvidence[evidence.publicKey] = evidence;
-  }
-  const checkpoints = {};
-  for (const [digest, checkpoint] of Object.entries(domain.checkpoints)) {
-    checkpoints[digest] = {
-      ...checkpoint,
-      evidence: checkpoint.evidence.map((evidence) => signerEvidence[evidence.publicKey] || evidence),
-    };
-  }
+  // 已激活检查点的签名证据是不可变历史：新接受的签名只追加到当前候选
+  // 自身的待签证据，绝不改写任何已激活检查点（即使同一公钥跨代参与授权）。
   let nextDomain = {
     ...domain,
-    signerEvidence,
-    checkpoints,
     rotations: { ...domain.rotations, [rotationId]: nextRotation },
   };
   let activated = false;
@@ -411,6 +404,76 @@ function submitSignatures(state, domainId, rotationId, signatures, now) {
   };
 }
 
+/**
+ * 加载时修复：把被后续候选签名改写的已激活检查点证据恢复为可验证的历史证据。
+ *
+ * 历史版本的缺陷：接受后续候选签名时会按公钥覆盖域内所有检查点的证据，
+ * 使已激活检查点中同一公钥的证据被替换成后代候选的签名（签名内容与接收时间
+ * 被改写，且无法验证该检查点自己的授权消息）。本函数逐检查点校验证据：
+ *  1. 能验证检查点自身授权消息的证据原样保留；
+ *  2. 否则从同一轮换标识的候选签名记录中找回能验证的原始签名（含原接收时间）；
+ *  3. 既无法验证也找不回的条目被移除。
+ * 只触碰已激活检查点的证据，并清理历史版本遗留的 signerEvidence 索引；
+ * 活动链头、待签候选、已拒结论与候选签名记录均不变。无需修复时返回原状态引用。
+ */
+function repairCheckpointEvidence(state) {
+  let changed = false;
+  const domains = {};
+  for (const [domainId, domain] of Object.entries(state.domains || {})) {
+    const repaired = repairDomainEvidence(domain);
+    domains[domainId] = repaired;
+    if (repaired !== domain) changed = true;
+  }
+  return changed ? { ...state, domains } : state;
+}
+
+function repairDomainEvidence(domain) {
+  let next = domain;
+  const checkpoints = {};
+  let changed = false;
+  for (const [digest, checkpoint] of Object.entries(domain.checkpoints || {})) {
+    const repaired = repairCheckpoint(domain, checkpoint);
+    checkpoints[digest] = repaired;
+    if (repaired !== checkpoint) changed = true;
+  }
+  if (changed) next = { ...next, checkpoints };
+  if (next.signerEvidence !== undefined) {
+    const { signerEvidence: _dropped, ...rest } = next;
+    next = rest;
+  }
+  return next;
+}
+
+function repairCheckpoint(domain, checkpoint) {
+  const evidence = Array.isArray(checkpoint.evidence) ? checkpoint.evidence : [];
+  if (evidence.length === 0) return checkpoint;
+  const message = authorizationMessage(checkpoint);
+  const record = domain.rotations ? domain.rotations[checkpoint.rotationId] : null;
+  const recorded = record && Array.isArray(record.signatures) ? record.signatures : [];
+  const seen = new Set();
+  const repaired = [];
+  let changed = false;
+  for (const entry of evidence) {
+    const publicKey = entry && typeof entry.publicKey === 'string' ? entry.publicKey : null;
+    if (publicKey && !seen.has(publicKey)) {
+      if (verifyAuthorization(message, String(entry.signature || ''), publicKey)) {
+        seen.add(publicKey);
+        repaired.push(entry);
+        continue;
+      }
+      const original = recorded.find(
+        (s) => s && s.publicKey === publicKey && verifyAuthorization(message, String(s.signature || ''), publicKey),
+      );
+      if (original) {
+        seen.add(publicKey);
+        repaired.push(original);
+      }
+    }
+    changed = true;
+  }
+  return changed ? { ...checkpoint, evidence: repaired } : checkpoint;
+}
+
 /** 当前活动链头视图（含签名证据）。 */
 function headView(domain) {
   const head = domain.checkpoints[domain.headDigest];
@@ -445,5 +508,6 @@ module.exports = {
   createDomain,
   createRotation,
   submitSignatures,
+  repairCheckpointEvidence,
   headView,
 };

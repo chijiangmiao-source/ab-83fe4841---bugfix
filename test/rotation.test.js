@@ -297,3 +297,152 @@ test('持久化：竞争候选并发达标，磁盘上只有一个活动检查�
   assert.equal(finalDomain.headDigest, activated[0].digest);
   assert.equal(Object.values(finalDomain.checkpoints).filter((c) => c.generation === 1).length, 1, '同代次只有一个活动检查点');
 });
+
+test('跨代轮换：后续候选收集签名不改写已激活检查点的历史证据', () => {
+  const memberA = genKey(); // 跨代保留的签名者
+  const memberB = genKey();
+  const nextC = genKey();
+  const nextD = genKey();
+  const { state: s0, domain } = makeDomain(freshState(), [memberA, memberB], 2);
+
+  // 第一轮：新密钥集保留 memberA；两名原成员分批完成有效签名
+  const s1 = rotation.createRotation(
+    s0,
+    domain.id,
+    { rotationId: 'gen-1', parentDigest: domain.headDigest, publicKeys: [nextC.publicKey, memberA.publicKey], threshold: 2 },
+    NOW,
+  ).state;
+  const rot1 = s1.domains[domain.id].rotations['gen-1'];
+  assert.ok(rot1.keys.includes(memberA.publicKey), '第一轮新密钥集应保留原父成员');
+  const msg1 = rotation.authorizationMessage(rot1);
+  const sigA1 = sign(memberA.privateKey, msg1);
+  const sigB1 = sign(memberB.privateKey, msg1);
+  const tA1 = '2026-10-06T01:00:00.000Z';
+  const tB1 = '2026-10-06T01:01:00.000Z';
+  const s2 = rotation.submitSignatures(s1, domain.id, 'gen-1', [{ publicKey: memberA.publicKey, signature: sigA1 }], tA1).state;
+  const done1 = rotation.submitSignatures(s2, domain.id, 'gen-1', [{ publicKey: memberB.publicKey, signature: sigB1 }], tB1);
+  assert.equal(done1.result.activated, true);
+  const head1 = done1.state.domains[domain.id].headDigest;
+  const evidence1 = structuredClone(done1.state.domains[domain.id].checkpoints[head1].evidence);
+  assert.equal(evidence1.length, 2);
+
+  // 第二轮：父密钥成员（第一轮的 {memberA, nextC}）仍包含被保留的 memberA；
+  // 只提交 memberA 对第二轮规范待签消息的首个有效签名
+  const s3 = rotation.createRotation(
+    done1.state,
+    domain.id,
+    { rotationId: 'gen-2', parentDigest: head1, publicKeys: [nextD.publicKey, memberA.publicKey], threshold: 2 },
+    NOW,
+  ).state;
+  const rot2 = s3.domains[domain.id].rotations['gen-2'];
+  const msg2 = rotation.authorizationMessage(rot2);
+  assert.notEqual(msg2, msg1, '两轮的规范待签消息必须不同');
+  const sigA2 = sign(memberA.privateKey, msg2);
+  const tA2 = '2026-10-06T02:00:00.000Z';
+  const second = rotation.submitSignatures(s3, domain.id, 'gen-2', [{ publicKey: memberA.publicKey, signature: sigA2 }], tA2);
+  assert.equal(second.result.activated, false);
+  assert.equal(second.result.signers, 1);
+
+  // 读取历史：第一轮检查点的两份证据未被改写，仍能验证其原始授权消息
+  const after = second.state.domains[domain.id];
+  assert.equal(after.headDigest, head1, '第二轮未达门限，链头不应前进');
+  const cp1 = after.checkpoints[head1];
+  assert.deepEqual(cp1.evidence, evidence1, '已激活检查点的证据（签名内容与接收时间）不得改变');
+  const byKey = Object.fromEntries(cp1.evidence.map((e) => [e.publicKey, e]));
+  assert.equal(byKey[memberA.publicKey].signature, sigA1);
+  assert.equal(byKey[memberA.publicKey].receivedAt, tA1);
+  assert.equal(byKey[memberB.publicKey].signature, sigB1);
+  assert.equal(byKey[memberB.publicKey].receivedAt, tB1);
+  for (const e of cp1.evidence) {
+    assert.ok(rotation.verifyAuthorization(msg1, e.signature, e.publicKey), '第一代证据必须仍能验证其原始授权消息');
+  }
+  // 第一轮候选的签名记录同样不变
+  assert.deepEqual(after.rotations['gen-1'].signatures, evidence1);
+  // 第二轮候选自身的待签证据正常累积
+  assert.deepEqual(after.rotations['gen-2'].signatures, [
+    { publicKey: memberA.publicKey, signature: sigA2, receivedAt: tA2 },
+  ]);
+});
+
+test('重启恢复：被改写的历史证据在加载时修复为可验证证据，其余状态不变', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rotation-repair-'));
+  const file = path.join(dir, 'state.json');
+  const store = new Store(file);
+  store.load();
+
+  const memberA = genKey(); // 跨代保留的签名者
+  const memberB = genKey();
+  const nextC = genKey();
+  const nextD = genKey();
+  const domain = await store.commit((s) =>
+    rotation.createDomain(s, { name: '修复域', publicKeys: [memberA.publicKey, memberB.publicKey], threshold: 2 }, NOW),
+  );
+  await store.commit((s) =>
+    rotation.createRotation(s, domain.id, { rotationId: 'gen-1', parentDigest: domain.headDigest, publicKeys: [memberA.publicKey, nextC.publicKey], threshold: 2 }, NOW),
+  );
+  await store.commit((s) =>
+    rotation.createRotation(s, domain.id, { rotationId: 'gen-1-rival', parentDigest: domain.headDigest, publicKeys: [nextC.publicKey, nextD.publicKey], threshold: 2 }, NOW),
+  );
+  const rot1 = store.state.domains[domain.id].rotations['gen-1'];
+  const msg1 = rotation.authorizationMessage(rot1);
+  await store.commit((s) =>
+    rotation.submitSignatures(s, domain.id, 'gen-1', [{ publicKey: memberA.publicKey, signature: sign(memberA.privateKey, msg1) }], '2026-10-06T01:00:00.000Z'),
+  );
+  await store.commit((s) =>
+    rotation.submitSignatures(s, domain.id, 'gen-1', [{ publicKey: memberB.publicKey, signature: sign(memberB.privateKey, msg1) }], '2026-10-06T01:01:00.000Z'),
+  );
+  const head1 = store.state.domains[domain.id].headDigest;
+  await store.commit((s) =>
+    rotation.createRotation(s, domain.id, { rotationId: 'gen-2', parentDigest: head1, publicKeys: [memberA.publicKey, nextD.publicKey], threshold: 2 }, NOW),
+  );
+  const rot2 = store.state.domains[domain.id].rotations['gen-2'];
+  const msg2 = rotation.authorizationMessage(rot2);
+  const sigA2 = sign(memberA.privateKey, msg2);
+  await store.commit((s) =>
+    rotation.submitSignatures(s, domain.id, 'gen-2', [{ publicKey: memberA.publicKey, signature: sigA2 }], '2026-10-06T02:00:00.000Z'),
+  );
+
+  const healthy = structuredClone(store.state.domains[domain.id]);
+  assert.equal(healthy.rotations['gen-1-rival'].status, 'superseded');
+  assert.equal(healthy.rotations['gen-2'].status, 'pending');
+
+  // 模拟历史版本缺陷留下的受损持久化状态：第一代检查点中 memberA 的证据
+  // 被其第二轮签名覆盖，并遗留 signerEvidence 索引
+  const corrupted = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const corruptedCp1 = corrupted.domains[domain.id].checkpoints[head1];
+  corruptedCp1.evidence = corruptedCp1.evidence.map((e) =>
+    e.publicKey === memberA.publicKey
+      ? { publicKey: memberA.publicKey, signature: sigA2, receivedAt: '2026-10-06T02:00:00.000Z' }
+      : e,
+  );
+  corrupted.domains[domain.id].signerEvidence = {
+    [memberA.publicKey]: { publicKey: memberA.publicKey, signature: sigA2, receivedAt: '2026-10-06T02:00:00.000Z' },
+  };
+  fs.writeFileSync(file, JSON.stringify(corrupted, null, 2) + '\n');
+
+  // 重开（重启）：受损证据恢复为可验证的历史证据，且与健康状态逐项一致
+  const reloaded = new Store(file);
+  reloaded.load();
+  const repaired = reloaded.state.domains[domain.id];
+  assert.deepEqual(repaired, healthy, '修复后状态应与未受损状态一致');
+  assert.equal(repaired.signerEvidence, undefined, '遗留的 signerEvidence 索引应被清理');
+  assert.equal(repaired.headDigest, head1, '修复不得改变活动链头');
+  assert.equal(repaired.rotations['gen-2'].status, 'pending', '修复不得改变当前待签候选');
+  assert.equal(repaired.rotations['gen-1-rival'].status, 'superseded', '修复不得改变竞争候选的拒绝结论');
+  for (const e of repaired.checkpoints[head1].evidence) {
+    assert.ok(rotation.verifyAuthorization(msg1, e.signature, e.publicKey), '修复后的第一代证据必须可验证');
+  }
+
+  // 重复签名处理不受修复影响
+  const dup = await reloaded.commit((s) =>
+    rotation.submitSignatures(s, domain.id, 'gen-2', [{ publicKey: memberA.publicKey, signature: sigA2 }], '2026-10-06T03:00:00.000Z'),
+  );
+  assert.equal(dup.results[0].code, 'duplicate_signature');
+  assert.equal(dup.signers, 1);
+
+  // 修复结果已原子落盘：再次加载保持一致；健康状态无需修复（返回原引用）
+  const again = new Store(file);
+  again.load();
+  assert.deepEqual(again.state.domains[domain.id], repaired);
+  assert.equal(rotation.repairCheckpointEvidence(again.state), again.state);
+});

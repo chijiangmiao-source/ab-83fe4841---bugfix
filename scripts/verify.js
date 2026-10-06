@@ -11,6 +11,7 @@
  *      - 页面渲染出相同结果；
  *      - 激活后的竞争候选与迟到补签被拒；
  *      - 并发竞争候选只收敛为一个活动检查点；
+ *      - 跨代保留签名者时，后续候选收集签名不改写已激活检查点的历史证据；
  *      - 应用重启后链头、历史检查点与签名证据保持一致；
  *      - 健康端点反映设备域状态。
  *   全部通过退出码 0，否则退出码 1。
@@ -82,6 +83,15 @@ function genKey() {
 
 function sign(key, message) {
   return crypto.sign(null, Buffer.from(message, 'utf8'), key.privateKey).toString('hex');
+}
+
+function verifySignature(key, message, signatureHex) {
+  return crypto.verify(
+    null,
+    Buffer.from(message, 'utf8'),
+    crypto.createPublicKey(key.privateKey),
+    Buffer.from(signatureHex, 'hex'),
+  );
 }
 
 function flipHex(hex) {
@@ -339,12 +349,139 @@ async function main() {
     domain2Head = after.headDigest;
   });
 
+  // —— 第三设备域：跨代保留签名者，已激活检查点的历史证据不可变 ——
+  const keepA = genKey(); // 跨代保留的签名者
+  const keepB = genKey();
+  const freshC = genKey();
+  const freshD = genKey();
+  const keyOf = new Map(
+    [keepA, keepB, freshC, freshD].map((k) => [k.publicKey, k]),
+  );
+  const evidenceVerifies = (entry, message) => verifySignature(keyOf.get(entry.publicKey), message, entry.signature);
+  let domain3Id;
+  let domain3Head;
+  let gen1Head;
+  let gen1Message;
+  let gen1Evidence;
+  let gen1SigA;
+
+  await step('跨代场景：完成第一轮轮换（新密钥集保留一名原父成员，两名原成员有效签名）', async () => {
+    const created = await api('POST', '/api/domains', {
+      name: '跨代保留签名域',
+      publicKeys: [keepB.publicKey, keepA.publicKey],
+      threshold: 2,
+    });
+    assertEqual(created.status, 201, `创建跨代设备域失败：${created.text}`);
+    domain3Id = created.json.id;
+    const genesis = created.json.headDigest;
+
+    const rot = await api('POST', `/api/domains/${domain3Id}/rotations`, {
+      rotationId: 'rot-gen-1',
+      parentDigest: genesis,
+      publicKeys: [freshC.publicKey, keepA.publicKey],
+      threshold: 2,
+    });
+    assertEqual(rot.status, 201, `创建第一轮候选失败：${rot.text}`);
+    assert(rot.json.keys.includes(keepA.publicKey), '第一轮新密钥集应保留原父成员');
+
+    const msgRes = await api('GET', `/api/domains/${domain3Id}/rotations/rot-gen-1/message`);
+    assertEqual(msgRes.status, 200, '应能读取第一轮规范待签消息');
+    gen1Message = msgRes.json.message;
+    gen1SigA = sign(keepA, gen1Message);
+    const gen1SigB = sign(keepB, gen1Message);
+
+    const first = await api('POST', `/api/domains/${domain3Id}/rotations/rot-gen-1/signatures`, {
+      signatures: [{ publicKey: keepA.publicKey, signature: gen1SigA }],
+    });
+    assertEqual(first.json.activated, false, '第一轮 1/2 不应激活');
+    const second = await api('POST', `/api/domains/${domain3Id}/rotations/rot-gen-1/signatures`, {
+      signatures: [{ publicKey: keepB.publicKey, signature: gen1SigB }],
+    });
+    assertEqual(second.json.activated, true, '第一轮 2/2 应激活');
+    gen1Head = second.json.headDigest;
+
+    const detail = (await api('GET', `/api/domains/${domain3Id}`)).json;
+    const cp1 = detail.checkpoints.find((c) => c.generation === 1);
+    assert(cp1, '应存在第一代检查点');
+    assertEqual(cp1.evidence.length, 2, '第一代应恰好有两份证据');
+    gen1Evidence = JSON.parse(JSON.stringify(cp1.evidence));
+    for (const e of gen1Evidence) {
+      assert(evidenceVerifies(e, gen1Message), '第一代证据应能验证其授权消息');
+    }
+  });
+
+  await step('跨代场景：第二轮仅补保留成员一票，第一代历史证据不被改写', async () => {
+    const rot = await api('POST', `/api/domains/${domain3Id}/rotations`, {
+      rotationId: 'rot-gen-2',
+      parentDigest: gen1Head,
+      publicKeys: [freshD.publicKey, keepA.publicKey],
+      threshold: 2,
+    });
+    assertEqual(rot.status, 201, `创建第二轮候选失败：${rot.text}`);
+
+    const msgRes = await api('GET', `/api/domains/${domain3Id}/rotations/rot-gen-2/message`);
+    const gen2Message = msgRes.json.message;
+    assert(gen2Message !== gen1Message, '两轮的规范待签消息必须不同');
+    const gen2SigA = sign(keepA, gen2Message);
+
+    const res = await api('POST', `/api/domains/${domain3Id}/rotations/rot-gen-2/signatures`, {
+      signatures: [{ publicKey: keepA.publicKey, signature: gen2SigA }],
+    });
+    assertEqual(res.json.results[0].status, 'accepted', '保留成员对第二轮的首个有效签名应被接受');
+    assertEqual(res.json.activated, false, '第二轮 1/2 不应激活');
+    assertEqual(res.json.signers, 1, '第二轮应记录 1 名签名者');
+
+    const detail = (await api('GET', `/api/domains/${domain3Id}`)).json;
+    assertEqual(detail.headDigest, gen1Head, '第二轮未达门限，链头不应前进');
+    const cp1 = detail.checkpoints.find((c) => c.generation === 1);
+    assert(
+      JSON.stringify(cp1.evidence) === JSON.stringify(gen1Evidence),
+      '第一代检查点的签名证据被后续候选改写（签名内容或接收时间变化）',
+    );
+    for (const e of cp1.evidence) {
+      assert(evidenceVerifies(e, gen1Message), '第一代证据必须仍能验证其原始授权消息');
+    }
+    const rot2 = detail.rotations.find((r) => r.rotationId === 'rot-gen-2');
+    assertEqual(rot2.signatures.length, 1, '第二轮候选自身应累积一份待签证据');
+    assertEqual(rot2.signatures[0].signature, gen2SigA, '第二轮候选的待签证据内容不符');
+  });
+
+  await step('跨代场景：第二轮达到门限后，第一代证据仍可验证原始授权消息', async () => {
+    const msgRes = await api('GET', `/api/domains/${domain3Id}/rotations/rot-gen-2/message`);
+    const gen2Message = msgRes.json.message;
+    const res = await api('POST', `/api/domains/${domain3Id}/rotations/rot-gen-2/signatures`, {
+      signatures: [{ publicKey: freshC.publicKey, signature: sign(freshC, gen2Message) }],
+    });
+    assertEqual(res.json.activated, true, '第二轮 2/2 应激活');
+
+    const head = (await api('GET', `/api/domains/${domain3Id}/head`)).json;
+    assertEqual(head.generation, 2, '链头代次应为 2');
+    domain3Head = head.digest;
+
+    const detail = (await api('GET', `/api/domains/${domain3Id}`)).json;
+    const cp1 = detail.checkpoints.find((c) => c.generation === 1);
+    assert(
+      JSON.stringify(cp1.evidence) === JSON.stringify(gen1Evidence),
+      '第二轮激活不得改写第一代证据',
+    );
+    for (const e of cp1.evidence) {
+      assert(evidenceVerifies(e, gen1Message), '第一代证据必须仍能验证其原始授权消息');
+    }
+    const cp2 = detail.checkpoints.find((c) => c.generation === 2);
+    assertEqual(cp2.evidence.length, 2, '第二代应恰好有两份证据');
+    for (const e of cp2.evidence) {
+      assert(evidenceVerifies(e, gen2Message), '第二代证据应能验证第二轮授权消息');
+    }
+  });
+
   // —— 重启一致性 ——
   let domain1Before;
   let domain2Before;
+  let domain3Before;
   await step('应用重启后：链头、历史检查点与签名证据保持一致', async () => {
     domain1Before = (await api('GET', `/api/domains/${domainId}`)).json;
     domain2Before = (await api('GET', `/api/domains/${domain2Id}`)).json;
+    domain3Before = (await api('GET', `/api/domains/${domain3Id}`)).json;
 
     const restart = await api('POST', '/api/admin/restart');
     assertEqual(restart.status, 202, `重启端点应返回 202：${restart.text}`);
@@ -354,6 +491,7 @@ async function main() {
 
     const domain1After = (await api('GET', `/api/domains/${domainId}`)).json;
     const domain2After = (await api('GET', `/api/domains/${domain2Id}`)).json;
+    const domain3After = (await api('GET', `/api/domains/${domain3Id}`)).json;
     assert(
       JSON.stringify(domain1After) === JSON.stringify(domain1Before),
       '验收域重启前后状态不一致（链头/检查点/证据丢失）',
@@ -362,17 +500,36 @@ async function main() {
       JSON.stringify(domain2After) === JSON.stringify(domain2Before),
       '并发域重启前后状态不一致（链头/检查点/证据丢失）',
     );
+    assert(
+      JSON.stringify(domain3After) === JSON.stringify(domain3Before),
+      '跨代域重启前后状态不一致（链头/检查点/证据丢失）',
+    );
     const head = (await api('GET', `/api/domains/${domainId}/head`)).json;
     assertEqual(head.digest, rotationDigest, '重启后链头摘要变化');
     assertEqual(head.evidence.length, 2, '重启后签名证据份数变化');
+  });
+
+  await step('跨代场景：重启后第一代证据仍可验证其原始授权消息', async () => {
+    const detail = (await api('GET', `/api/domains/${domain3Id}`)).json;
+    assertEqual(detail.headDigest, domain3Head, '重启后跨代域链头变化');
+    const cp1 = detail.checkpoints.find((c) => c.generation === 1);
+    assert(
+      JSON.stringify(cp1.evidence) === JSON.stringify(gen1Evidence),
+      '重启后第一代证据的签名内容或接收时间变化',
+    );
+    for (const e of cp1.evidence) {
+      assert(evidenceVerifies(e, gen1Message), '重启后第一代证据必须仍能验证其原始授权消息');
+    }
   });
 
   await step('健康响应在重启后仍反映设备域状态', async () => {
     const health = (await api('GET', '/healthz')).json;
     const d1 = health.domains.find((d) => d.id === domainId);
     const d2 = health.domains.find((d) => d.id === domain2Id);
+    const d3 = health.domains.find((d) => d.id === domain3Id);
     assert(d1 && d1.headDigest === rotationDigest, '健康响应中验收域链头不符');
     assert(d2 && d2.headDigest === domain2Head, '健康响应中并发域链头不符');
+    assert(d3 && d3.headDigest === domain3Head, '健康响应中跨代域链头不符');
   });
 
   await step('页面显示与接口相同的结果（链头、证据、检查点分组）', async () => {
@@ -387,6 +544,8 @@ async function main() {
     assert(page.text.includes('已拒'), '页面缺少已拒检查点分组');
     assert(page.text.includes('待签'), '页面缺少待签检查点分组');
     assert(page.text.includes('race-1') && page.text.includes('race-2'), '页面未显示竞争候选记录');
+    assert(page.text.includes('rot-gen-1') && page.text.includes('rot-gen-2'), '页面未显示跨代轮换记录');
+    assert(page.text.includes(gen1SigA), '页面未显示跨代第一代的原始签名证据');
   });
 
   console.log('');

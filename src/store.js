@@ -12,10 +12,16 @@
  * 因此“收集到足够签名 → 激活候选 → 取代竞争候选 → 链头前进”
  * 永远落在同一次持久化提交里；并发的补签/重传在队列中串行收敛，
  * 不会产生第二个活动检查点。
+ *
+ * 启动加载时会校验已激活检查点的历史签名证据（见
+ * rotation.repairCheckpointEvidence）：被历史版本缺陷改写的证据
+ * 在同一启动流程中恢复为可验证的原始签名并原子落盘。
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
+
+const rotation = require('./rotation');
 
 const STATE_VERSION = 1;
 
@@ -39,7 +45,10 @@ class Store {
       if (!parsed || parsed.version !== STATE_VERSION || typeof parsed.domains !== 'object' || parsed.domains === null) {
         throw new Error(`状态文件损坏或版本不受支持：${this.file}`);
       }
-      this.state = parsed;
+      // 修复历史版本缺陷改写的已激活检查点证据；有修复则同次启动原子落盘。
+      const repaired = rotation.repairCheckpointEvidence(parsed);
+      if (repaired !== parsed) this._persist(repaired);
+      this.state = repaired;
     } else {
       this.state = initialState();
       this._persist(this.state);
